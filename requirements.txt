@@ -1,0 +1,11 @@
+# Invoice Processor – Ohad Kazoom (עוסק מורשה)
+# Install: pip install -r requirements.txt
+# Tesseract binary also required: sudo apt install tesseract-ocr tesseract-ocr-heb
+# PDF support: sudo apt install poppler-utils
+
+anthropic>=0.40.0          # Claude API (claude-opus-4-6)
+pytesseract>=0.3.10        # Tesseract OCR Python wrapper
+Pillow>=10.0.0             # Image handling
+pdf2image>=1.17.0          # PDF → PIL image (requires poppler-utils)
+python-dateutil>=2.8.2     # Robust date parsing (Hebrew & English)
+openpyxl>=3.1.0            # Excel report generation

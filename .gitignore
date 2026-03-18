@@ -1,0 +1,10 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Invoice files (private financial data)
+incoming_invoices/
+processed/
+
+# Old registry
+processed.json
