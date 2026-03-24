@@ -6,5 +6,10 @@ __pycache__/
 incoming_invoices/
 processed/
 
-# Old registry
+# Registries (contain private financial data)
 processed.json
+processed_ohad.json
+processed_cril.json
+
+# Environment / secrets
+.env

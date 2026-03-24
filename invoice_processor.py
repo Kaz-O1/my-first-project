@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -22,6 +23,20 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# ── API key fallback for non-interactive shells (e.g. bat file) ───────────────
+# When bash runs non-interactively it skips ~/.bashrc guards, so the key may
+# not be in the environment.  Try to pull it from ~/.bashrc directly.
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    try:
+        for _line in (Path.home() / ".bashrc").read_text(errors="ignore").splitlines():
+            if _line.startswith("export ANTHROPIC_API_KEY="):
+                _val = _line.split("=", 1)[1].strip().strip("'\"")
+                if _val:
+                    os.environ["ANTHROPIC_API_KEY"] = _val
+                break
+    except Exception:
+        pass
 
 import anthropic
 
@@ -34,19 +49,25 @@ logger = logging.getLogger(__name__)
 
 # ── Paths & constants ─────────────────────────────────────────────────────────
 
-BASE_DIR      = Path(__file__).parent
+BASE_DIR = Path(__file__).parent
+
+# Google Drive paths (WSL mount of G:\My Drive\חשבוניות אוהד כזום)
+GDRIVE_ROOT     = Path("/mnt/g/My Drive/חשבוניות אוהד כזום")
+GDRIVE_INVOICES = GDRIVE_ROOT / "ALL Invoices"
+GDRIVE_REPORTS  = GDRIVE_ROOT / "Reports"
+
 DASHBOARD_PATH = BASE_DIR / "processed" / "dashboard.html"
 
 ENTITIES: dict[str, dict] = {
     "ohad": {
         "label":          "Ohad Kazoom",
-        "incoming_dir":   BASE_DIR / "incoming_invoices" / "ohad",
-        "processed_base": BASE_DIR / "processed" / "ohad",
+        "incoming_dir":   GDRIVE_INVOICES / "ohad",           # reads from Google Drive
+        "processed_base": BASE_DIR / "processed" / "ohad",    # output stays local
         "registry_path":  BASE_DIR / "processed_ohad.json",
     },
     "cril-tech": {
         "label":          "Cril-Tech",
-        "incoming_dir":   BASE_DIR / "incoming_invoices" / "cril-tech",
+        "incoming_dir":   GDRIVE_INVOICES / "cril-tech",      # reads from Google Drive
         "processed_base": BASE_DIR / "processed" / "cril-tech",
         "registry_path":  BASE_DIR / "processed_cril.json",
     },
@@ -1450,7 +1471,28 @@ def process_file(
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
+def _check_gdrive() -> None:
+    """Verify Google Drive is mounted and accessible. Exit with instructions if not."""
+    if not Path("/mnt/g").exists():
+        logger.error("=" * 60)
+        logger.error("Google Drive (G:) is not mounted in WSL.")
+        logger.error("Run this ONCE in your WSL terminal:")
+        logger.error("  bash /home/ohad/my-first-project/setup_gdrive.sh")
+        logger.error("=" * 60)
+        import sys; sys.exit(1)
+    if not GDRIVE_ROOT.exists():
+        logger.error("=" * 60)
+        logger.error(f"Path not found: {GDRIVE_ROOT}")
+        logger.error("Make sure Google Drive for Desktop is running on Windows.")
+        logger.error("Then try: sudo mount -t drvfs G: /mnt/g")
+        logger.error("=" * 60)
+        import sys; sys.exit(1)
+    logger.info(f"Google Drive OK: {GDRIVE_ROOT}")
+
+
 def run(regenerate_reports: bool = False) -> None:
+    _check_gdrive()
+
     # Ensure all directories exist
     for cfg in ENTITIES.values():
         cfg["incoming_dir"].mkdir(parents=True, exist_ok=True)
@@ -1491,7 +1533,7 @@ def run(regenerate_reports: bool = False) -> None:
             if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
         )
         if not files:
-            logger.info(f"[{entity_key}] No files in {cfg['incoming_dir'].relative_to(BASE_DIR)}")
+            logger.info(f"[{entity_key}] No files in {cfg['incoming_dir']}")
             continue
 
         logger.info(f"[{entity_key}] Found {len(files)} file(s)")
