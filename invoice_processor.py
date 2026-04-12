@@ -130,7 +130,7 @@ def open_as_pil_images(file_path: Path) -> list:
     if suffix == ".pdf":
         try:
             from pdf2image import convert_from_path
-            return convert_from_path(str(file_path), dpi=200)
+            return convert_from_path(str(file_path), dpi=300)
         except Exception as e:
             logger.warning(f"pdf2image failed for {file_path.name}: {e}")
             return []
@@ -144,32 +144,76 @@ def open_as_pil_images(file_path: Path) -> list:
             return []
 
 
+def preprocess_for_claude(img):
+    """Enhance scanned receipt image quality before sending to Claude API."""
+    from PIL import Image, ImageEnhance
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    # Upscale if shortest side is below 1 000 px (receipt scans can be narrow)
+    min_dim = min(img.width, img.height)
+    if min_dim < 1000:
+        scale = 1000 / min_dim
+        img = img.resize(
+            (int(img.width * scale), int(img.height * scale)),
+            resample=Image.LANCZOS,
+        )
+    # Boost contrast and sharpness for faded/thermal-paper receipts
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+    return img
+
+
 def to_png_base64(file_path: Path) -> tuple[str, str]:
     suffix = file_path.suffix.lower()
-    NATIVE_TYPES = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png",  ".gif":  "image/gif", ".webp": "image/webp",
-    }
     if suffix == ".pdf":
-        images = open_as_pil_images(file_path)
-        if images:
-            buf = io.BytesIO()
-            images[0].save(buf, format="PNG")
-            return base64.standard_b64encode(buf.getvalue()).decode(), "image/png"
+        # Fallback path: pdf2image unavailable → send raw PDF to Claude document API
         with open(file_path, "rb") as f:
             return base64.standard_b64encode(f.read()).decode(), "application/pdf"
-    # For all image types: open with PIL to detect the *actual* format
-    # (avoids sending wrong media_type for mislabelled files, e.g. .png that is JPEG)
+    # All image types: open with PIL, preprocess, then encode as PNG for Claude
     images = open_as_pil_images(file_path)
     if images:
-        img = images[0]
-        actual_fmt = img.format or "PNG"   # PIL detects real format
-        SAVE_MAP = {"JPEG": ("JPEG", "image/jpeg"), "WEBP": ("WEBP", "image/webp")}
-        save_fmt, media = SAVE_MAP.get(actual_fmt, ("PNG", "image/png"))
+        img = preprocess_for_claude(images[0])
         buf = io.BytesIO()
-        img.save(buf, format=save_fmt)
-        return base64.standard_b64encode(buf.getvalue()).decode(), media
+        img.save(buf, format="PNG")
+        return base64.standard_b64encode(buf.getvalue()).decode(), "image/png"
     raise ValueError(f"Cannot encode {file_path.name} for Claude API")
+
+
+# ── PDF page splitter ─────────────────────────────────────────────────────────
+
+def expand_pdf_pages(file_path: Path) -> list[tuple[Path, bool]]:
+    """Return a list of (path, is_temp) tuples for a file.
+
+    * Non-PDF files → [(file_path, False)]  (no-op)
+    * Single-page PDF → [(temp_png, True)]   (one enhanced PNG)
+    * Multi-page PDF  → [(page1.png, True), (page2.png, True), ...]
+
+    Each page is converted at 300 DPI and saved to a temporary directory.
+    The caller is responsible for deleting the temp files when done.
+    """
+    if file_path.suffix.lower() != ".pdf":
+        return [(file_path, False)]
+
+    try:
+        from pdf2image import convert_from_path
+        images = convert_from_path(str(file_path), dpi=300)
+    except Exception as e:
+        logger.warning(f"pdf2image failed for {file_path.name}: {e} – will send raw PDF")
+        return [(file_path, False)]
+
+    if not images:
+        return [(file_path, False)]
+
+    import tempfile
+    temp_dir = Path(tempfile.mkdtemp(prefix="inv_pages_"))
+    stem = file_path.stem
+    pages: list[tuple[Path, bool]] = []
+    for i, img in enumerate(images, start=1):
+        page_path = temp_dir / f"{stem}_p{i:02d}.png"
+        img.save(page_path, format="PNG")
+        pages.append((page_path, True))
+    logger.info(f"  Split {file_path.name} → {len(pages)} page(s) in {temp_dir.name}")
+    return pages
 
 
 # ── Tesseract OCR ─────────────────────────────────────────────────────────────
@@ -1540,12 +1584,26 @@ def run(regenerate_reports: bool = False) -> None:
         new_invoices: list[InvoiceData] = []
 
         for file_path in files:
-            inv = process_file(
-                file_path, client, registry,
-                cfg["registry_path"], cfg["processed_base"],
-            )
-            if inv:
-                new_invoices.append(inv)
+            page_entries = expand_pdf_pages(file_path)
+            temp_dirs: set[Path] = set()
+            for page_path, is_temp in page_entries:
+                if is_temp:
+                    temp_dirs.add(page_path.parent)
+                try:
+                    inv = process_file(
+                        page_path, client, registry,
+                        cfg["registry_path"], cfg["processed_base"],
+                    )
+                    if inv:
+                        new_invoices.append(inv)
+                finally:
+                    if is_temp:
+                        page_path.unlink(missing_ok=True)
+            for temp_dir in temp_dirs:
+                try:
+                    temp_dir.rmdir()
+                except OSError:
+                    pass
 
         if not new_invoices:
             logger.info(f"[{entity_key}] No new invoices.")
