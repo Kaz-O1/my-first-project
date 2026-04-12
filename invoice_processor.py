@@ -130,7 +130,7 @@ def open_as_pil_images(file_path: Path) -> list:
     if suffix == ".pdf":
         try:
             from pdf2image import convert_from_path
-            return convert_from_path(str(file_path), dpi=300)
+            return convert_from_path(str(file_path), dpi=200)
         except Exception as e:
             logger.warning(f"pdf2image failed for {file_path.name}: {e}")
             return []
@@ -144,76 +144,74 @@ def open_as_pil_images(file_path: Path) -> list:
             return []
 
 
-def preprocess_for_claude(img):
-    """Enhance scanned receipt image quality before sending to Claude API."""
+_CLAUDE_MAX_BYTES = 4 * 1024 * 1024  # 4 MB — safe margin below Claude's 5 MB limit
+
+
+def _encode_image_for_claude(img) -> tuple[str, str]:
+    """Preprocess a PIL image and encode it for Claude API.
+
+    1. Converts to RGB.
+    2. Caps longest side at 2 500 px (keeps text readable, avoids huge files).
+    3. Boosts contrast + sharpness for faded/thermal receipts.
+    4. Tries PNG (lossless); falls back to JPEG if the result exceeds 4 MB.
+    """
     from PIL import Image, ImageEnhance
+
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
-    # Upscale if shortest side is below 1 000 px (receipt scans can be narrow)
-    min_dim = min(img.width, img.height)
-    if min_dim < 1000:
-        scale = 1000 / min_dim
+
+    # Downscale if too large (scanned photos can be 3 000+ px)
+    max_dim = max(img.width, img.height)
+    if max_dim > 2500:
+        scale = 2500 / max_dim
         img = img.resize(
             (int(img.width * scale), int(img.height * scale)),
             resample=Image.LANCZOS,
         )
-    # Boost contrast and sharpness for faded/thermal-paper receipts
+
+    # Enhance clarity for thermal / faded receipts
     img = ImageEnhance.Contrast(img).enhance(1.5)
     img = ImageEnhance.Sharpness(img).enhance(2.0)
-    return img
+
+    # Try PNG first
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    if buf.tell() <= _CLAUDE_MAX_BYTES:
+        return base64.standard_b64encode(buf.getvalue()).decode(), "image/png"
+
+    # PNG too large → JPEG
+    img_rgb = img.convert("RGB")
+    buf = io.BytesIO()
+    img_rgb.save(buf, format="JPEG", quality=85)
+    if buf.tell() <= _CLAUDE_MAX_BYTES:
+        return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
+
+    # Still too large → shrink progressively
+    while buf.tell() > _CLAUDE_MAX_BYTES:
+        scale = (_CLAUDE_MAX_BYTES / buf.tell()) ** 0.5 * 0.9
+        img_rgb = img_rgb.resize(
+            (max(1, int(img_rgb.width * scale)), max(1, int(img_rgb.height * scale))),
+            resample=Image.LANCZOS,
+        )
+        buf = io.BytesIO()
+        img_rgb.save(buf, format="JPEG", quality=85)
+    logger.info(f"  Image shrunk to {img_rgb.width}×{img_rgb.height} to fit Claude limit")
+    return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
 
 
 def to_png_base64(file_path: Path) -> tuple[str, str]:
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
-        # Fallback path: pdf2image unavailable → send raw PDF to Claude document API
+        images = open_as_pil_images(file_path)
+        if images:
+            return _encode_image_for_claude(images[0])
+        # pdf2image unavailable — send raw PDF via Claude document API
         with open(file_path, "rb") as f:
             return base64.standard_b64encode(f.read()).decode(), "application/pdf"
-    # All image types: open with PIL, preprocess, then encode as PNG for Claude
     images = open_as_pil_images(file_path)
     if images:
-        img = preprocess_for_claude(images[0])
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64.standard_b64encode(buf.getvalue()).decode(), "image/png"
+        return _encode_image_for_claude(images[0])
     raise ValueError(f"Cannot encode {file_path.name} for Claude API")
-
-
-# ── PDF page splitter ─────────────────────────────────────────────────────────
-
-def expand_pdf_pages(file_path: Path) -> list[tuple[Path, bool]]:
-    """Return a list of (path, is_temp) tuples for a file.
-
-    * Non-PDF files → [(file_path, False)]  (no-op)
-    * Single-page PDF → [(temp_png, True)]   (one enhanced PNG)
-    * Multi-page PDF  → [(page1.png, True), (page2.png, True), ...]
-
-    Each page is converted at 300 DPI and saved to a temporary directory.
-    The caller is responsible for deleting the temp files when done.
-    """
-    if file_path.suffix.lower() != ".pdf":
-        return [(file_path, False)]
-
-    try:
-        from pdf2image import convert_from_path
-        images = convert_from_path(str(file_path), dpi=300)
-    except Exception as e:
-        logger.warning(f"pdf2image failed for {file_path.name}: {e} – will send raw PDF")
-        return [(file_path, False)]
-
-    if not images:
-        return [(file_path, False)]
-
-    import tempfile
-    temp_dir = Path(tempfile.mkdtemp(prefix="inv_pages_"))
-    stem = file_path.stem
-    pages: list[tuple[Path, bool]] = []
-    for i, img in enumerate(images, start=1):
-        page_path = temp_dir / f"{stem}_p{i:02d}.png"
-        img.save(page_path, format="PNG")
-        pages.append((page_path, True))
-    logger.info(f"  Split {file_path.name} → {len(pages)} page(s) in {temp_dir.name}")
-    return pages
 
 
 # ── Tesseract OCR ─────────────────────────────────────────────────────────────
@@ -408,6 +406,13 @@ Rules:
 - If the invoice explicitly shows no VAT (foreign vendor, export invoice), set vat_amount to 0.
 - If this appears to be a credit card charge screenshot (no formal invoice, just a total \
 charge), the total already includes 18% Israeli VAT: set vat_amount = round(total*18/118, 2).
+- Date parsing rules (apply in order):
+  1. A 4-digit component is always the year (e.g. 19/03/2026 → 2026-03-19).
+  2. A 2-digit year is always 20XX (e.g. 26 → 2026, never 1926 or 2019).
+  3. If the first component is > 12 it must be the day → format is DD/MM/YY[YY].
+  4. Use invoice language/currency as a tiebreaker for ambiguous cases: \
+Hebrew text or ₪ → DD/MM/YY (Israeli); English-only with $ → MM/DD/YY (US).
+  5. Never treat a 2-digit leading number as a year.
 - Return ONLY the JSON object.\
 """
 
@@ -900,6 +905,133 @@ def _open_in_browser(path: Path) -> None:
         logger.warning(f"Could not auto-open browser: {e}")
 
 
+def _build_alerts_html() -> str:
+    """Always-visible alerts banner — uses localStorage to persist dismissals.
+
+    Each invoice that needs attention gets a row with a 'Reviewed ✓' checkbox.
+    Checking it writes the file_hash to localStorage so the alert won't reappear
+    on the next dashboard load (even after the HTML is regenerated).
+    """
+    return """
+<style>
+#alerts-section{margin-bottom:28px;border-radius:12px;overflow:hidden;
+  box-shadow:0 1px 4px rgba(0,0,0,.10);}
+.alerts-header{display:flex;align-items:center;gap:10px;padding:14px 20px;
+  background:#7c3030;color:#fff;cursor:pointer;user-select:none;}
+.alerts-header:hover{background:#8c3a3a;}
+.alerts-icon{font-size:1.1rem;}
+#alerts-summary{flex:1;font-weight:600;font-size:.95rem;}
+.alerts-toggle{font-size:1rem;transition:transform .2s;}
+.alerts-toggle.open{transform:rotate(180deg);}
+#alerts-body{background:#fff;border:1px solid #f5c6c6;border-top:none;}
+.alert-item{display:flex;align-items:center;gap:12px;padding:12px 20px;
+  border-bottom:1px solid #fdeaea;}
+.alert-item:last-child{border-bottom:none;}
+.alert-item.dismissed{display:none;}
+.alert-badge{padding:2px 9px;border-radius:8px;font-size:.72rem;font-weight:700;
+  white-space:nowrap;}
+.alert-badge.fail{background:#fde8e8;color:#c0392b;}
+.alert-badge.warn{background:#fff3cd;color:#856404;}
+.alert-name{flex:1;font-size:.85rem;color:#1F3A5F;font-weight:600;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.alert-entity{font-size:.75rem;color:#718096;margin-left:4px;font-weight:400;}
+.alert-issues{font-size:.78rem;color:#718096;}
+.alert-dismiss label{display:flex;align-items:center;gap:6px;cursor:pointer;
+  font-size:.82rem;color:#2ECC71;font-weight:600;white-space:nowrap;}
+.alert-dismiss input{cursor:pointer;accent-color:#2ECC71;width:15px;height:15px;}
+#alerts-all-clear{padding:18px 20px;text-align:center;color:#2ECC71;
+  font-weight:600;font-size:.9rem;display:none;}
+</style>
+
+<div id="alerts-section" style="display:none">
+  <div class="alerts-header" onclick="toggleAlerts()">
+    <span class="alerts-icon">&#9888;</span>
+    <span id="alerts-summary"></span>
+    <span class="alerts-toggle" id="alerts-toggle">&#9660;</span>
+  </div>
+  <div id="alerts-body">
+    <div id="alerts-all-clear">&#10003; All alerts reviewed — great job!</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var STORE_KEY = 'invoiceDismissedAlerts';
+  function getDismissed(){ try{ return JSON.parse(localStorage.getItem(STORE_KEY)||'{}'); }catch(e){ return {}; } }
+  function setDismissed(d){ localStorage.setItem(STORE_KEY, JSON.stringify(d)); }
+
+  function collectItems(){
+    var dismissed = getDismissed();
+    var all=[], pending=[];
+    for(var ek in DATA.entities){
+      var rev = DATA.entities[ek].review || [];
+      rev.forEach(function(i){ all.push(Object.assign({},i,{entity:ek})); });
+    }
+    all.forEach(function(i){ if(!dismissed[i.file_hash]) pending.push(i); });
+    return {all:all, pending:pending};
+  }
+
+  function renderAlerts(){
+    var result = collectItems();
+    var section = document.getElementById('alerts-section');
+    var body    = document.getElementById('alerts-body');
+    var summary = document.getElementById('alerts-summary');
+    var allClear= document.getElementById('alerts-all-clear');
+    if(!result.all.length){ section.style.display='none'; return; }
+    section.style.display='block';
+    var n = result.pending.length;
+    summary.textContent = n > 0
+      ? n + ' invoice' + (n>1?'s':'')+' need your attention'
+      : 'All alerts reviewed';
+    allClear.style.display = n===0 ? 'block' : 'none';
+    var rows = result.all.map(function(inv){
+      var dismissed = getDismissed()[inv.file_hash];
+      var isFail = inv.ocr_method==='failed';
+      var issues = [];
+      if(isFail) issues.push('Processing failed');
+      else{ if(!inv.invoice_date) issues.push('Missing date'); if(!inv.total_amount) issues.push('Missing amount'); }
+      return '<div class="alert-item'+(dismissed?' dismissed':'')+'" id="ait-'+inv.file_hash+'">'+
+        '<span class="alert-badge '+(isFail?'fail':'warn')+'">'+(isFail?'FAILED':'WARNING')+'</span>'+
+        '<div style="flex:1;min-width:0">'+
+          '<span class="alert-name">'+inv.file_name+'<span class="alert-entity">['+inv.entity+']</span></span><br>'+
+          '<span class="alert-issues">'+issues.join(' &middot; ')+'</span>'+
+        '</div>'+
+        '<div class="alert-dismiss"><label>'+
+          '<input type="checkbox"'+(dismissed?' checked':'')+' onchange="dismissAlert(\''+inv.file_hash+'\',this)">'+
+          ' Reviewed &#10003;'+
+        '</label></div>'+
+      '</div>';
+    }).join('');
+    body.insertAdjacentHTML('afterbegin', rows);
+  }
+
+  window.dismissAlert = function(hash, cb){
+    var d = getDismissed();
+    if(cb.checked){ d[hash]=true; } else { delete d[hash]; }
+    setDismissed(d);
+    var row = document.getElementById('ait-'+hash);
+    if(row) row.classList.toggle('dismissed', cb.checked);
+    var result = collectItems();
+    var n = result.pending.length;
+    document.getElementById('alerts-summary').textContent = n > 0
+      ? n + ' invoice'+(n>1?'s':'')+' need your attention'
+      : 'All alerts reviewed';
+    document.getElementById('alerts-all-clear').style.display = n===0 ? 'block' : 'none';
+  };
+
+  var _open = true;
+  window.toggleAlerts = function(){
+    _open = !_open;
+    document.getElementById('alerts-body').style.display = _open ? 'block' : 'none';
+    document.getElementById('alerts-toggle').classList.toggle('open', _open);
+  };
+
+  renderAlerts();
+})();
+</script>
+"""
+
+
 def generate_html_dashboard(all_registries: dict, server_mode: bool = False) -> None:
     """Build processed/dashboard.html and open it in the browser."""
     data          = _build_dashboard_data(all_registries)
@@ -908,6 +1040,7 @@ def generate_html_dashboard(all_registries: dict, server_mode: bool = False) -> 
     generated     = data["generated"]
     review_html   = _build_review_html(CATEGORIES) if server_mode else ""
     review_btn    = '<button class="review-btn" id="review-btn" onclick="openReview()">Review</button>' if server_mode else ""
+    alerts_html   = _build_alerts_html()
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1031,6 +1164,7 @@ footer {{ text-align: center; padding: 24px; color: #A0AEC0;
 </header>
 
 <div class="container">
+{alerts_html}
   <div class="cards"        id="summary-cards"></div>
   <div class="section-title">Year</div>
   <div class="year-tabs"    id="year-tabs"></div>
@@ -1584,26 +1718,12 @@ def run(regenerate_reports: bool = False) -> None:
         new_invoices: list[InvoiceData] = []
 
         for file_path in files:
-            page_entries = expand_pdf_pages(file_path)
-            temp_dirs: set[Path] = set()
-            for page_path, is_temp in page_entries:
-                if is_temp:
-                    temp_dirs.add(page_path.parent)
-                try:
-                    inv = process_file(
-                        page_path, client, registry,
-                        cfg["registry_path"], cfg["processed_base"],
-                    )
-                    if inv:
-                        new_invoices.append(inv)
-                finally:
-                    if is_temp:
-                        page_path.unlink(missing_ok=True)
-            for temp_dir in temp_dirs:
-                try:
-                    temp_dir.rmdir()
-                except OSError:
-                    pass
+            inv = process_file(
+                file_path, client, registry,
+                cfg["registry_path"], cfg["processed_base"],
+            )
+            if inv:
+                new_invoices.append(inv)
 
         if not new_invoices:
             logger.info(f"[{entity_key}] No new invoices.")
@@ -1634,13 +1754,13 @@ def run(regenerate_reports: bool = False) -> None:
             print(f"    Method: {inv.ocr_method}")
         print(sep + "\n")
 
-    if any_new:
-        # Reload updated registries before building dashboard
-        all_registries = {
-            key: (cfg, load_registry(cfg["registry_path"]))
-            for key, cfg in ENTITIES.items()
-        }
-        generate_html_dashboard(all_registries)
+    # Always regenerate and open the dashboard so the user can see alerts
+    # even when all files were already processed (no new invoices this run).
+    all_registries = {
+        key: (cfg, load_registry(cfg["registry_path"]))
+        for key, cfg in ENTITIES.items()
+    }
+    generate_html_dashboard(all_registries)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
