@@ -407,12 +407,18 @@ Rules:
 - If this appears to be a credit card charge screenshot (no formal invoice, just a total \
 charge), the total already includes 18% Israeli VAT: set vat_amount = round(total*18/118, 2).
 - Date parsing rules (apply in order):
-  1. A 4-digit component is always the year (e.g. 19/03/2026 → 2026-03-19).
-  2. A 2-digit year is always 20XX (e.g. 26 → 2026, never 1926 or 2019).
-  3. If the first component is > 12 it must be the day → format is DD/MM/YY[YY].
-  4. Use invoice language/currency as a tiebreaker for ambiguous cases: \
-Hebrew text or ₪ → DD/MM/YY (Israeli); English-only with $ → MM/DD/YY (US).
-  5. Never treat a 2-digit leading number as a year.
+  1. Use ONLY the date from a labeled invoice field (e.g. "Invoice Date:", "תאריך:"). \
+Ignore any dates visible in browser print headers/footers (e.g. "4/9/26, 11:14 AM" at top of \
+printed web pages) — those are the print timestamp, not the invoice date.
+  2. A 4-digit component is always the year (e.g. 19/03/2026 → 2026-03-19).
+  3. A 2-digit year ≤ 99 is always 20XX (e.g. 26 → 2026, 06 → 2006). \
+But 06 as a DAY (first position in Israeli format) is NOT a year.
+  4. If the first component is > 12 it must be the day → format is DD/MM/YY[YY].
+  5. Israeli invoices (any Hebrew text present, or ₪ currency): ALWAYS DD/MM/YY[YY]. \
+The format YY/MM/DD does not exist in Israeli invoices — the first component is always the day, \
+never the year. So 06/04/26 in a Hebrew invoice = day=06, month=04, year=2026, not year=2006.
+  6. English-only invoice with $ → MM/DD/YY (US format).
+  7. Mixed or ambiguous: prefer DD/MM/YY if any Hebrew text or ₪ is present.
 - Return ONLY the JSON object.\
 """
 
@@ -1573,9 +1579,13 @@ def process_file(
         import pytesseract  # noqa
         ocr_text, confidence = tesseract_ocr(file_path)
         if validate_ocr(ocr_text, confidence):
-            logger.info(f"Tesseract OK ({confidence:.0f}% confidence)")
             extracted = extract_from_text(ocr_text)
-            method    = "tesseract"
+            if extracted.get("total_amount") is not None:
+                logger.info(f"Tesseract OK ({confidence:.0f}% confidence)")
+                method = "tesseract"
+            else:
+                logger.info(f"Tesseract read text but could not extract total amount – falling back to Claude API")
+                extracted = {}
         else:
             logger.info(f"Tesseract validation failed ({confidence:.0f}%), falling back to Claude API")
     except ImportError:
