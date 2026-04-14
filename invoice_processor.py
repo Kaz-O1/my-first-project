@@ -104,10 +104,12 @@ class InvoiceData:
     currency:         str             = "ILS"  # original invoice currency
     original_amount:  Optional[float] = None   # amount in original currency (pre-conversion)
     exchange_rate:    Optional[float] = None   # ILS per 1 unit of foreign currency
+    client_name:      Optional[str]   = None
     category:         str             = "other"
     ocr_method:       str             = "unknown"
     processed_at:     str             = ""
     destination_path: str             = ""
+    excluded:         bool            = False
 
     def __post_init__(self):
         if not self.processed_at:
@@ -382,7 +384,8 @@ Extract the following fields from this invoice image.
 Return exactly this JSON structure:
 {
   "invoice_date":   "YYYY-MM-DD or null",
-  "vendor_name":    "company or person name, or null",
+  "vendor_name":    "company or person name issuing the invoice, or null",
+  "client_name":    "name of the client/customer the invoice is addressed to (who is being charged), or null if not stated",
   "invoice_number": "invoice number string, or null",
   "currency":       "ISO currency code: ILS / USD / EUR / GBP / etc.",
   "total_amount":   <grand total in the invoice's OWN currency including VAT, or null>,
@@ -564,9 +567,9 @@ def copy_to_processed(src: Path, invoice: InvoiceData, processed_base: Path) -> 
 
 # ── Excel report ──────────────────────────────────────────────────────────────
 
-_HEADERS    = ["File Name", "Date", "Vendor", "Invoice #",
+_HEADERS    = ["File Name", "Date", "Vendor", "Client", "Invoice #",
                "Total (₪)", "VAT (₪)", "Net (₪)", "Category", "OCR Method"]
-_COL_WIDTHS = [32, 12, 26, 16, 13, 13, 13, 22, 14]
+_COL_WIDTHS = [32, 12, 26, 22, 16, 13, 13, 13, 22, 14]
 
 
 def generate_excel_report(month_folder: Path, invoices: list[InvoiceData]) -> None:
@@ -596,12 +599,15 @@ def generate_excel_report(month_folder: Path, invoices: list[InvoiceData]) -> No
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "A2"
 
+    invoices = [i for i in invoices if not getattr(i, "excluded", False)]
+
     for row_idx, inv in enumerate(invoices, start=2):
         net = round(inv.total_amount - inv.vat_amount, 2) \
               if inv.total_amount is not None and inv.vat_amount is not None else None
         row = [
             inv.file_name, inv.invoice_date or "Unknown", inv.vendor_name or "Unknown",
-            inv.invoice_number or "N/A", inv.total_amount, inv.vat_amount, net,
+            getattr(inv, "client_name", None) or "", inv.invoice_number or "N/A",
+            inv.total_amount, inv.vat_amount, net,
             inv.category, inv.ocr_method,
         ]
         alt = row_idx % 2 == 0
@@ -610,7 +616,7 @@ def generate_excel_report(month_folder: Path, invoices: list[InvoiceData]) -> No
             c.border = bdr
             if alt:
                 c.fill = alt_fill
-            if col in (5, 6, 7):
+            if col in (6, 7, 8):
                 c.alignment = num_align
                 if value is not None:
                     c.number_format = '#,##0.00'
@@ -625,7 +631,7 @@ def generate_excel_report(month_folder: Path, invoices: list[InvoiceData]) -> No
             c.fill, c.font, c.border = sum_fill, sum_font, bdr
             if col == 1:
                 c.value, c.alignment = "TOTAL", str_align
-            elif col in (5, 6, 7):
+            elif col in (6, 7, 8):
                 cl = get_column_letter(col)
                 c.value = f"=SUM({cl}2:{cl}{last_data})"
                 c.number_format, c.alignment = '#,##0.00', num_align
@@ -684,6 +690,7 @@ def _build_dashboard_data(all_registries: dict) -> dict:
     for entity_key, (entity_cfg, registry) in all_registries.items():
         months: dict = {}
         review: list = []
+        excluded_list: list = []
 
         for fhash, data in registry.items():
             # Always collect incomplete / failed invoices for the review panel
@@ -703,6 +710,18 @@ def _build_dashboard_data(all_registries: dict) -> dict:
                 })
 
             if data.get("ocr_method") == "failed" or not data.get("destination_path"):
+                continue
+            if data.get("excluded"):
+                excluded_list.append({
+                    "file_hash":    fhash,
+                    "file_name":    data.get("file_name", ""),
+                    "invoice_date": data.get("invoice_date"),
+                    "vendor_name":  data.get("vendor_name"),
+                    "client_name":  data.get("client_name"),
+                    "total_amount": data.get("total_amount"),
+                    "currency":     data.get("currency", "ILS"),
+                    "category":     data.get("category", "other"),
+                })
                 continue
 
             dest   = Path(data["destination_path"])
@@ -741,6 +760,7 @@ def _build_dashboard_data(all_registries: dict) -> dict:
                 "file_name":      data.get("file_name", ""),
                 "invoice_date":   data.get("invoice_date"),
                 "vendor_name":    data.get("vendor_name"),
+                "client_name":    data.get("client_name"),
                 "invoice_number": data.get("invoice_number"),
                 "currency":       data.get("currency", "ILS"),
                 "original_amount":data.get("original_amount"),
@@ -758,9 +778,10 @@ def _build_dashboard_data(all_registries: dict) -> dict:
             m["vat"]   = round(m["vat"],   2)
 
         result["entities"][entity_key] = {
-            "label":  entity_cfg["label"],
-            "months": dict(sorted(months.items())),
-            "review": review,
+            "label":    entity_cfg["label"],
+            "months":   dict(sorted(months.items())),
+            "review":   review,
+            "excluded": excluded_list,
         }
     return result
 
@@ -1157,6 +1178,21 @@ tr:last-child td {{ border-bottom: none; }}
 .no-data {{ color: #CBD5E0; font-style: italic; }}
 footer {{ text-align: center; padding: 24px; color: #A0AEC0;
           font-size: .78rem; margin-top: 48px; }}
+
+/* ── Exclude / restore ── */
+.excl-btn {{ background: none; border: 1px solid #FCA5A5; color: #E74C3C;
+             border-radius: 6px; padding: 3px 9px; font-size: .75rem;
+             cursor: pointer; white-space: nowrap; }}
+.excl-btn:hover {{ background: #fde8e8; }}
+.restore-btn {{ background: none; border: 1px solid #86EFAC; color: #16A34A;
+                border-radius: 6px; padding: 3px 9px; font-size: .75rem;
+                cursor: pointer; white-space: nowrap; }}
+.restore-btn:hover {{ background: #dcfce7; }}
+.excl-section {{ margin-top: 0; }}
+.excl-section-hdr {{ background: #FEF9C3; color: #92400E; font-size: .78rem;
+                      font-weight: 600; padding: 7px 14px; border-top: 2px solid #FDE68A; }}
+tr.excl-row td {{ background: #FFFBEB !important; color: #9CA3AF;
+                  font-style: italic; text-decoration: line-through; }}
 </style>
 </head>
 <body>
@@ -1281,6 +1317,54 @@ function renderMonthGrid() {{
   document.getElementById('main-content').innerHTML = `<div class="month-grid">${{cards}}</div>`;
 }}
 
+// ── Exclude / restore ──────────────────────────────────────────────────────
+
+function excludeInvoice(entity, hash) {{
+  if (!confirm('הוצא חשבונית זו מהחישוב?\\nהיא תוסר מהסכומים ומדוח האקסל אך הקובץ ישאר בתיקייה.')) return;
+  fetch('/api/update', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{entity, hash, excluded: true}})
+  }}).then(r => r.json()).then(d => {{
+    if (d.ok) location.reload();
+    else alert('שגיאה: ' + d.error);
+  }}).catch(() => alert('לא ניתן להתחבר לשרת'));
+}}
+
+function restoreInvoice(entity, hash) {{
+  if (!confirm('שחזר חשבונית זו לחישוב?')) return;
+  fetch('/api/update', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{entity, hash, excluded: false}})
+  }}).then(r => r.json()).then(d => {{
+    if (d.ok) location.reload();
+    else alert('שגיאה: ' + d.error);
+  }}).catch(() => alert('לא ניתן להתחבר לשרת'));
+}}
+
+function buildExcludedSection(entity) {{
+  const key = `${{state.year}}-${{state.month}}`;
+  const excl = (ed().excluded || []).filter(inv => {{
+    if (!inv.invoice_date) return false;
+    const [y, m] = inv.invoice_date.split('-');
+    return `${{y}}-${{m.padStart(2,'0')}}` === key || `${{y}}-${{parseInt(m)}}` === key;
+  }});
+  if (!excl.length) return '';
+  const rows = excl.map(inv => `
+    <tr class="excl-row">
+      <td>${{inv.invoice_date || '—'}}</td>
+      <td>${{inv.vendor_name  || '—'}}</td>
+      <td>${{inv.client_name  || '—'}}</td>
+      <td>—</td>
+      <td class="r" style="text-decoration:line-through">${{inv.total_amount != null ? '₪\u202F'+inv.total_amount.toLocaleString('he-IL',{{minimumFractionDigits:2}}) : '—'}}</td>
+      <td class="r">—</td><td class="r">—</td>
+      <td><span class="badge" style="background:#f3f4f6;color:#9ca3af">${{inv.category}}</span></td>
+      <td><button class="restore-btn" onclick="restoreInvoice('${{entity}}','${{inv.file_hash}}')">↩ שחזר</button></td>
+    </tr>`).join('');
+  return `<tr><td colspan="9" class="excl-section-hdr">⊘ מוצאות מהחישוב (${{excl.length}})</td></tr>${{rows}}`;
+}}
+
 // ── Render: month detail ───────────────────────────────────────────────────
 
 function renderMonthDetail() {{
@@ -1292,6 +1376,7 @@ function renderMonthDetail() {{
     <tr>
       <td>${{inv.invoice_date || '<span class="no-data">—</span>'}}</td>
       <td>${{inv.vendor_name  || '<span class="no-data">—</span>'}}</td>
+      <td>${{inv.client_name  || '<span class="no-data">—</span>'}}</td>
       <td>${{inv.invoice_number || '<span class="no-data">—</span>'}}</td>
       <td class="r">${{fmt(inv.total_amount)}}</td>
       <td class="r">${{fmt(inv.vat_amount)}}</td>
@@ -1300,6 +1385,8 @@ function renderMonthDetail() {{
             style="background:${{(CAT_COLORS[inv.category]||'#95A5A6')}}22;
                    color:${{CAT_COLORS[inv.category]||'#95A5A6'}}"
           >${{inv.category}}</span></td>
+      <td><button class="excl-btn" title="הוצא מהחשבוניות"
+            onclick="excludeInvoice('${{state.entity}}','${{inv.file_hash}}')">✕ הוצא</button></td>
     </tr>`).join('');
 
   const net = m.total - m.vat;
@@ -1323,17 +1410,18 @@ function renderMonthDetail() {{
       <div class="table-wrap">
         <table>
           <thead><tr>
-            <th>Date</th><th>Vendor</th><th>Invoice #</th>
+            <th>Date</th><th>Vendor</th><th>Client</th><th>Invoice #</th>
             <th class="r">Total (₪)</th><th class="r">VAT (₪)</th>
-            <th class="r">Net (₪)</th><th>Category</th>
+            <th class="r">Net (₪)</th><th>Category</th><th></th>
           </tr></thead>
           <tbody>${{rows}}</tbody>
+          ${{buildExcludedSection(state.entity)}}
           <tfoot><tr class="tfoot">
-            <td colspan="3">TOTAL (${{m.count}} invoices)</td>
+            <td colspan="4">TOTAL (${{m.count}} invoices)</td>
             <td class="r">${{fmtPlain(m.total)}}</td>
             <td class="r">${{fmtPlain(m.vat)}}</td>
             <td class="r">${{fmtPlain(net)}}</td>
-            <td></td>
+            <td></td><td></td>
           </tr></tfoot>
         </table>
       </div>
@@ -1496,6 +1584,7 @@ def run_server(port: int = 8080) -> None:
                             InvoiceData(**d) for d in registry.values()
                             if d.get("destination_path") and
                                Path(d["destination_path"]).parent == old_dest.parent
+                               and not d.get("excluded")
                         ]
                         if old_dest.parent.exists():
                             generate_excel_report(old_dest.parent, old_month_invoices)
@@ -1510,6 +1599,7 @@ def run_server(port: int = 8080) -> None:
                     all_month = [
                         InvoiceData(**d) for d in registry.values()
                         if d.get("destination_path") and Path(d["destination_path"]).parent == mf
+                        and not d.get("excluded")
                     ]
                     generate_excel_report(mf, all_month)
 
@@ -1635,6 +1725,7 @@ def process_file(
         file_hash       = fhash,
         invoice_date    = extracted.get("invoice_date"),
         vendor_name     = extracted.get("vendor_name"),
+        client_name     = extracted.get("client_name"),
         invoice_number  = extracted.get("invoice_number"),
         total_amount    = total,
         vat_amount      = vat,
@@ -1764,13 +1855,8 @@ def run(regenerate_reports: bool = False) -> None:
             print(f"    Method: {inv.ocr_method}")
         print(sep + "\n")
 
-    # Always regenerate and open the dashboard so the user can see alerts
-    # even when all files were already processed (no new invoices this run).
-    all_registries = {
-        key: (cfg, load_registry(cfg["registry_path"]))
-        for key, cfg in ENTITIES.items()
-    }
-    generate_html_dashboard(all_registries)
+    # Start interactive dashboard server so user can exclude/review invoices
+    run_server(port=8080)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
