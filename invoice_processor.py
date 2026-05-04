@@ -283,12 +283,27 @@ def validate_ocr(text: str, confidence: float) -> bool:
 # ── Text-based field extraction ───────────────────────────────────────────────
 
 def _parse_date(text: str) -> Optional[str]:
-    from dateutil import parser as dp
     m = _DATE_RE.search(text)
-    if m:
+    if not m:
+        return None
+    raw = m.group(0).strip()
+    # ISO: YYYY-MM-DD or YYYY/MM/DD
+    iso = re.match(r'(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})$', raw)
+    if iso:
+        y, mo, d = int(iso.group(1)), int(iso.group(2)), int(iso.group(3))
         try:
-            return dp.parse(m.group(0), dayfirst=True).strftime("%Y-%m-%d")
-        except Exception:
+            return datetime(y, mo, d).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    # DD/MM/YY[YY] — rightmost component is ALWAYS the year (Israeli convention)
+    dmy = re.match(r'(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})$', raw)
+    if dmy:
+        d, mo, y = int(dmy.group(1)), int(dmy.group(2)), int(dmy.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            return datetime(y, mo, d).strftime("%Y-%m-%d")
+        except ValueError:
             pass
     return None
 
