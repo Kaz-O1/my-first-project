@@ -1670,9 +1670,18 @@ def process_file(
         ocr_text, confidence = tesseract_ocr(file_path)
         if validate_ocr(ocr_text, confidence):
             extracted = extract_from_text(ocr_text)
-            if extracted.get("total_amount") is not None:
+            date_str  = extracted.get("invoice_date")  # "YYYY-MM-DD" or None
+            date_year = int(date_str[:4]) if date_str else None
+            cur_year  = datetime.now().year
+            date_ok   = date_year is not None and (cur_year - 5) <= date_year <= (cur_year + 1)
+            if extracted.get("total_amount") is not None and date_ok:
                 logger.info(f"Tesseract OK ({confidence:.0f}% confidence)")
                 method = "tesseract"
+            elif extracted.get("total_amount") is not None and not date_ok:
+                logger.info(
+                    f"Tesseract date suspicious ({date_str!r}, year {date_year}) – falling back to Claude API"
+                )
+                extracted = {}
             else:
                 logger.info(f"Tesseract read text but could not extract total amount – falling back to Claude API")
                 extracted = {}
